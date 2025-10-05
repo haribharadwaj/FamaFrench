@@ -112,28 +112,60 @@ def build_us_ff5_mom():
 
 # ---------- Global ex-US FF5 + Momentum (multiple fallbacks) ----------
 def build_global_exus_ff5_mom():
-    # try Global ex-US zip first
-    five = _read_ff_zip(
+    """
+    Build Global ex-US 5 Factors + Momentum.
+    Tries multiple known URLs and mirrors.
+    """
+
+    fallback_urls = [
+        # Primary URL (recently moved or renamed)
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Minus_US_5_Factors_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_CSV.zip",
+        # Former canonical (often reappears)
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_EX_US_CSV.zip",
-        require_cols=["MKT_RF","SMB","HML","RMW","CMA","RF"]
-    )
-    # momentum: ex-US if available, else global momentum
-    try:
-        mom = _read_ff_zip(
-            "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip",
-            require_cols=["Mom"]
-        )
-    except Exception:
-        mom = _read_ff_zip(
-            "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip",
-            require_cols=["Mom"]
-        )
+    ]
+
+    five = None
+    for url in fallback_urls:
+        try:
+            print(f"Trying {url} ...")
+            five = _read_ff_zip(url, require_cols=["MKT_RF", "SMB", "HML", "RMW", "CMA", "RF"])
+            print(f"✅ Loaded 5-factor data from {url}")
+            break
+        except Exception as e:
+            print(f"⚠️  Failed {url}: {e}")
+            continue
+
+    if five is None:
+        raise RuntimeError("❌ Could not download any version of Global/Developed ex-US 5-factor dataset")
+
+    # Momentum fallback list
+    mom_urls = [
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_MOM_Factor_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip",
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip",
+    ]
+
+    mom = None
+    for url in mom_urls:
+        try:
+            print(f"Trying momentum {url} ...")
+            mom = _read_ff_zip(url, require_cols=["Mom"])
+            print(f"✅ Loaded Momentum data from {url}")
+            break
+        except Exception as e:
+            print(f"⚠️  Failed momentum URL {url}: {e}")
+            continue
+
+    if mom is None:
+        raise RuntimeError("❌ Could not download any version of Global/Developed ex-US momentum factor")
+
+    # Merge, harmonize, and fill missing columns
     df = five.join(mom, how="left")
-    df = _ensure_all_cols(df, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
-    _write_all("global_exus_ff5_mom", df, sources=[
-        "Ken French Data Library: Global_5_Factors_EX_US (Monthly)",
-        "Ken French Data Library: Global_ex_US_MOM_Factor / Global_MOM_Factor (Monthly)"
-    ])
+    df = _ensure_all_cols(df, ["MKT_RF", "SMB", "HML", "RMW", "CMA", "Mom", "RF"])
+    _write_all("global_exus_ff5_mom", df, sources=fallback_urls + mom_urls)
+
 
 if __name__ == "__main__":
     print("Building US FF5 + Momentum…")
