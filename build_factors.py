@@ -1,46 +1,72 @@
-# build_factors.py
-import io, zipfile, re, json, requests, pandas as pd
+#!/usr/bin/env python3
+# build_factors.py — refresh Fama–French factor artifacts for this repo
+# Outputs (percent units, month-end index):
+#   data/us_ff5_mom.(parquet|csv.gz)            meta/us_ff5_mom.json
+#   data/global_exus_ff5_mom.(parquet|csv.gz)   meta/global_exus_ff5_mom.json
+#
+# Notes:
+# - The ex-US artifact uses the Developed ex-US series (current and maintained),
+#   but keeps the legacy stem "global_exus_ff5_mom" for backward compatibility.
+
+from __future__ import annotations
+
+import io
+import json
+import re
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
+from typing import Iterable
 
-OUT = Path("data"); META = Path("meta")
-OUT.mkdir(exist_ok=True); META.mkdir(exist_ok=True)
+import pandas as pd
+import requests
 
-# ---------- robust CSV slicer for Ken French zips ----------
-def _read_ff_zip(url, require_cols):
-    """
-    Download a Ken French ZIP, slice the monthly section only,
-    return a DataFrame indexed by month-end (percent units).
-    """
+# ---------- Output locations ----------
+OUT_DIR = Path("data")
+META_DIR = Path("meta")
+OUT_DIR.mkdir(exist_ok=True)
+META_DIR.mkdir(exist_ok=True)
+
+# ---------- Source URLs (current, maintained) ----------
+US_5F_URL   = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
+US_MOM_URL  = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
+
+DEXUS_5F_URL  = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip"
+DEXUS_MOM_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Mom_Factor_CSV.zip"
+
+# ---------- Robust monthly CSV extractor for Ken French zips ----------
+def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
+    """Download a Ken French ZIP, extract the monthly table, return DataFrame with month-end index."""
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    csv_name = [n for n in z.namelist() if n.lower().endswith(".csv")][0]
-    text = z.open(csv_name).read().decode("latin-1", errors="ignore")
-    lines = text.splitlines()
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        text = zf.open(csv_name).read().decode("latin-1", errors="ignore")
 
-    # First monthly row looks like YYYYMM (allow 1963-07 variants)
+    lines = text.splitlines()
     yyyymm = re.compile(r"^\s*([12]\d{3})\s*[-/ ]?\s*(\d{2})\s*([,;]|\s|$)")
 
-    # Find start of monthly block and the header just above it
-    data_start = None
+    # find header line immediately above the first monthly row
+    first_row = None
     for i, ln in enumerate(lines):
         first = ln.split(",")[0].strip()
         if yyyymm.match(first):
-            data_start = i; break
-    if data_start is None:
-        raise ValueError("Monthly block not found.")
+            first_row = i
+            break
+    if first_row is None:
+        raise ValueError(f"Monthly block not found in: {url}")
 
     header_idx = None
-    for j in range(data_start-1, max(-1, data_start-50), -1):
+    for j in range(first_row - 1, max(-1, first_row - 60), -1):
         if lines[j].strip():
-            header_idx = j; break
+            header_idx = j
+            break
     if header_idx is None:
-        raise ValueError("Header line not found.")
+        raise ValueError(f"Header line not found for monthly block: {url}")
 
-    # Collect contiguous monthly lines
+    # capture contiguous monthly rows
     block = [lines[header_idx]]
-    for ln in lines[data_start:]:
+    for ln in lines[first_row:]:
         first = ln.split(",")[0].strip()
         if not first or not yyyymm.match(first):
             break
@@ -49,176 +75,88 @@ def _read_ff_zip(url, require_cols):
     df = pd.read_csv(io.StringIO("\n".join(block)))
     df.columns = [c.strip() for c in df.columns]
     date_col = df.columns[0]
-    for c in df.columns:
-        if c != date_col:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Parse YYYYMM/1963-07 to month-end
-    def to_me(s):
+    for c in df.columns[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    def _to_me(s: str):
         s = str(s).strip()
         m = re.match(r"^(\d{4})[-/ ]?(\d{2})$", s)
         if m:
             return pd.to_datetime(f"{m.group(1)}-{m.group(2)}") + pd.offsets.MonthEnd(0)
         return pd.to_datetime(s).to_period("M").to_timestamp("M")
-    df[date_col] = df[date_col].map(to_me)
-    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
-    # Standardize names
-    df = df.rename(columns={"Mkt-RF":"MKT_RF","MKT-RF":"MKT_RF"})
-    # Keep only needed/available
-    keep = [c for c in require_cols if c in df.columns]
-    return df[keep]
 
-def _ensure_all_cols(df, all_cols):
-    for c in all_cols:
+    df[date_col] = df[date_col].map(_to_me)
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    return df
+
+def _harmonize_cols(df: pd.DataFrame, require: Iterable[str]) -> pd.DataFrame:
+    rename = {"Mkt-RF": "MKT_RF", "MKT-RF": "MKT_RF", "Mkt_RF": "MKT_RF", "Mom   ": "Mom"}
+    df = df.rename(columns={c: rename.get(c, c) for c in df.columns})
+    keep = [c for c in require if c in df.columns]
+    return df[keep].copy()
+
+def _ensure_all_cols(df: pd.DataFrame, ordered_cols: Iterable[str]) -> pd.DataFrame:
+    for c in ordered_cols:
         if c not in df.columns:
             df[c] = pd.NA
-    # canonical order
-    return df[[c for c in all_cols]]
+    return df[list(ordered_cols)]
 
-def _write_all(name, df, sources, extras=None):
+def _coverage(df: pd.DataFrame) -> str:
+    return f"{df.index.min():%Y-%m} → {df.index.max():%Y-%m}  (n={len(df)})"
+
+def _write_artifacts(stem: str, df: pd.DataFrame, sources: list[str], extras: dict | None = None):
     df = df.sort_index()
-    # Write parquet and gzipped csv
-    OUT.mkdir(exist_ok=True); META.mkdir(exist_ok=True)
-    df.to_parquet(OUT / f"{name}.parquet", index=True)
-    df.to_csv(OUT / f"{name}.csv.gz", compression="gzip", float_format="%.6f")
+    # parquet
+    (OUT_DIR / f"{stem}.parquet").write_bytes(df.to_parquet(index=True))
+    # csv.gz
+    df.to_csv(OUT_DIR / f"{stem}.csv.gz", compression="gzip", float_format="%.6f")
 
     meta = {
-        "dataset": name,
+        "dataset": stem,
         "first_date": df.index.min().strftime("%Y-%m-%d"),
         "last_date": df.index.max().strftime("%Y-%m-%d"),
         "rows": int(df.shape[0]),
-        "columns": df.columns.tolist(),
+        "columns": list(df.columns),
         "units": "percent",
         "index": "month_end",
         "sources": sources,
-        "built_utc": datetime.utcnow().isoformat() + "Z",
-        "notes": "Always include columns MKT_RF, SMB, HML, RMW, CMA, Mom, RF; missing columns filled with NaN."
+        "built_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "notes": "Columns in percent; month-end index. Missing columns (if any) filled with NaN before save.",
     }
     if extras:
         meta.update(extras)
-
-    (META / f"{name}.json").write_text(json.dumps(meta, indent=2))
-
+    (META_DIR / f"{stem}.json").write_text(json.dumps(meta, indent=2))
 
 # ---------- US FF5 + Momentum ----------
 def build_us_ff5_mom():
-    five = _read_ff_zip(
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip",
-        require_cols=["MKT_RF","SMB","HML","RMW","CMA","RF"]
+    print("Building US FF5 + Momentum …")
+    five = _harmonize_cols(_read_ff_zip_monthly(US_5F_URL), ["MKT_RF", "SMB", "HML", "RMW", "CMA", "RF"])
+    mom  = _harmonize_cols(_read_ff_zip_monthly(US_MOM_URL),  ["Mom"])
+    print("  5F:",  _coverage(five))
+    print("  MOM:", _coverage(mom))
+
+    df = _ensure_all_cols(five.join(mom, how="left"), ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
+    _write_artifacts("us_ff5_mom", df, [US_5F_URL, US_MOM_URL], extras={"universe": "US", "includes_emerging": False})
+    print("  ✅ US FF5+Mom:", _coverage(df))
+
+# ---------- Developed ex-US FF5 + Momentum (saved under legacy global_exus_ff5_mom) ----------
+def build_developed_exus_ff5_mom_as_global_stem():
+    print("Building Developed ex-US FF5 + Momentum (output: global_exus_ff5_mom) …")
+    five = _harmonize_cols(_read_ff_zip_monthly(DEXUS_5F_URL),  ["MKT_RF","SMB","HML","RMW","CMA","RF"])
+    mom  = _harmonize_cols(_read_ff_zip_monthly(DEXUS_MOM_URL), ["Mom"])
+    print("  5F:",  _coverage(five))
+    print("  MOM:", _coverage(mom))
+
+    df = _ensure_all_cols(five.join(mom, how="left"), ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
+    _write_artifacts(
+        "global_exus_ff5_mom", df,
+        [DEXUS_5F_URL, DEXUS_MOM_URL],
+        extras={"universe": "Developed ex-US", "includes_emerging": False}
     )
-    mom = _read_ff_zip(
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip",
-        require_cols=["Mom"]
-    )
-    df = five.join(mom, how="left")
-    df = _ensure_all_cols(df, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
-    _write_all("us_ff5_mom", df, sources=[
-        "Ken French Data Library: F-F_Research_Data_5_Factors_2x3 (Monthly)",
-        "Ken French Data Library: F-F_Momentum_Factor (Monthly)"
-    ])
+    print("  ✅ Developed ex-US FF5+Mom:", _coverage(df))
 
-# ---------- Global ex-US FF5 + Momentum (multiple fallbacks) ----------
-def _coverage_str(df: pd.DataFrame) -> str:
-    return f"{df.index.min():%Y-%m} → {df.index.max():%Y-%m}  (n={len(df)})"
-
-def build_global_exus_ff5_mom():
-    """
-    Build a Global ex-US (Developed + Emerging, excluding U.S.) FF5 + Momentum dataset
-    when available; otherwise fall back to Developed ex-US. Writes a single file:
-      data/global_exus_ff5_mom.(parquet|csv.gz)
-    Metadata includes 'universe' and 'includes_emerging'.
-    """
-
-    # Candidate 5-factor tables (try EM-inclusive first)
-    five_candidates = [
-        # Prefer: Global ex-US (Dev + EM, no US)
-        ("Global ex-US", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_EX_US_CSV.zip", True),
-        # Sometimes the site serves a generic 'Global_5_Factors_CSV.zip' with subpanels; our slicer grabs monthly.
-        ("Global ex-US (generic)", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_CSV.zip", True),
-        # Fall back: Developed ex-US (excludes Emerging)
-        ("Developed ex-US", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip", False),
-        ("Developed ex-US (minus US)", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Minus_US_5_Factors_CSV.zip", False),
-    ]
-
-    five = None
-    five_label = None
-    includes_em = None
-    five_source = None
-
-    for label, url, inc_em in five_candidates:
-        try:
-            print(f"Trying 5-factor: {label} … {url}")
-            tmp = _read_ff_zip(url, require_cols=["MKT_RF","SMB","HML","RMW","CMA","RF"])
-            five = tmp.rename(columns={"Mkt-RF":"MKT_RF","MKT-RF":"MKT_RF"})
-            five = five[[c for c in ["MKT_RF","SMB","HML","RMW","CMA","RF"] if c in five.columns]]
-            five_label = label
-            includes_em = bool(inc_em)
-            five_source = url
-            print(f"  ✅ 5-factor loaded: {_coverage_str(five)}")
-            break
-        except Exception as e:
-            print(f"  ⚠️ {label} failed: {e}")
-
-    if five is None:
-        raise RuntimeError("❌ Could not download Global/Developed ex-US 5-factor dataset from any candidate URL.")
-
-    # Candidate momentum tables (match universe if possible)
-    mom_candidates = [
-        # ex-US momentum variants
-        ("Global ex-US Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip"),
-        ("Developed ex-US Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_MOM_Factor_CSV.zip"),
-        # global momentum as a last resort
-        ("Global Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip"),
-    ]
-
-    mom = None
-    mom_source = None
-    for label, url in mom_candidates:
-        try:
-            print(f"Trying momentum: {label} … {url}")
-            tmp = _read_ff_zip(url, require_cols=["Mom"])
-            mom = tmp.copy()
-            # Harmonize column name to 'Mom'
-            if "Mom" not in mom.columns:
-                alt = [c for c in mom.columns if "mom" in c.lower()]
-                if alt:
-                    mom = mom.rename(columns={alt[0]: "Mom"})
-            mom = mom[["Mom"]]
-            mom_source = url
-            print(f"  ✅ Momentum loaded: {_coverage_str(mom)}")
-            break
-        except Exception as e:
-            print(f"  ⚠️ {label} failed: {e}")
-
-    if mom is None:
-        raise RuntimeError("❌ Could not download any ex-US momentum factor (ex-US or global).")
-
-    # Merge and finalize schema
-    df = five.join(mom, how="left")
-    df = _ensure_all_cols(df, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
-
-    # Report coverage in console
-    print("=== Global/Developed ex-US FF5 + Mom ===")
-    print(f"Universe: {five_label}  |  includes_emerging={includes_em}")
-    print(f"Coverage: {_coverage_str(df)}")
-    print(f"5-factor source: {five_source}")
-    print(f"Momentum source: {mom_source}")
-
-    # Write with rich metadata
-    _write_all(
-        "global_exus_ff5_mom",
-        df,
-        sources=[five_source, mom_source],
-        extras={
-            "universe": five_label,
-            "includes_emerging": bool(includes_em)
-        }
-    )
-
-
-
+# ---------- Main ----------
 if __name__ == "__main__":
-    print("Building US FF5 + Momentum…")
     build_us_ff5_mom()
-    print("Building Global ex-US FF5 + Momentum…")
-    build_global_exus_ff5_mom()
-    print("Done. Files in ./data and metadata in ./meta")
+    build_developed_exus_ff5_mom_as_global_stem()
+    print("Done. Files written to ./data and metadata to ./meta")
