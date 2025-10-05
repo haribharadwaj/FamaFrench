@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-# build_factors.py — refresh Fama–French factor artifacts for this repo
-# Outputs (percent units, month-end index):
-#   data/us_ff5_mom.(parquet|csv.gz)            meta/us_ff5_mom.json
-#   data/global_exus_ff5_mom.(parquet|csv.gz)   meta/global_exus_ff5_mom.json
-#
-# Notes:
-# - The ex-US artifact uses the Developed ex-US series (current and maintained),
-#   but keeps the legacy stem "global_exus_ff5_mom" for backward compatibility.
+# build_factors.py — rebuild Fama–French factor artifacts with alignment checks
 
 from __future__ import annotations
 
@@ -16,27 +9,28 @@ import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Tuple
 
 import pandas as pd
 import requests
 
-# ---------- Output locations ----------
+# ---------- Output folders ----------
 OUT_DIR = Path("data")
 META_DIR = Path("meta")
 OUT_DIR.mkdir(exist_ok=True)
 META_DIR.mkdir(exist_ok=True)
 
-# ---------- Source URLs (current, maintained) ----------
+# ---------- Source URLs (current) ----------
 US_5F_URL   = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
 US_MOM_URL  = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
 
 DEXUS_5F_URL  = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip"
 DEXUS_MOM_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Mom_Factor_CSV.zip"
 
-# ---------- Robust monthly CSV extractor for Ken French zips ----------
+# ---------- Parsing helpers ----------
 def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
-    """Download a Ken French ZIP, extract the monthly table, return DataFrame with month-end index."""
+    """Download a Ken French ZIP, extract the MONTHLY table, return DataFrame with a
+    clean month-end DateTimeIndex and numeric columns coerced to float."""
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
@@ -46,7 +40,7 @@ def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
     lines = text.splitlines()
     yyyymm = re.compile(r"^\s*([12]\d{3})\s*[-/ ]?\s*(\d{2})\s*([,;]|\s|$)")
 
-    # find header line immediately above the first monthly row
+    # locate first monthly row
     first_row = None
     for i, ln in enumerate(lines):
         first = ln.split(",")[0].strip()
@@ -56,13 +50,14 @@ def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
     if first_row is None:
         raise ValueError(f"Monthly block not found in: {url}")
 
+    # header is the last non-empty line above the first monthly row
     header_idx = None
     for j in range(first_row - 1, max(-1, first_row - 60), -1):
         if lines[j].strip():
             header_idx = j
             break
     if header_idx is None:
-        raise ValueError(f"Header line not found for monthly block: {url}")
+        raise ValueError(f"Header line for monthly block not found: {url}")
 
     # capture contiguous monthly rows
     block = [lines[header_idx]]
@@ -75,9 +70,12 @@ def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO("\n".join(block)))
     df.columns = [c.strip() for c in df.columns]
     date_col = df.columns[0]
+
+    # coerce numerics
     for c in df.columns[1:]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # to month-end index
     def _to_me(s: str):
         s = str(s).strip()
         m = re.match(r"^(\d{4})[-/ ]?(\d{2})$", s)
@@ -86,23 +84,69 @@ def _read_ff_zip_monthly(url: str) -> pd.DataFrame:
         return pd.to_datetime(s).to_period("M").to_timestamp("M")
 
     df[date_col] = df[date_col].map(_to_me)
-    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    df = df.dropna(subset=[date_col]).set_index(date_col)
+    # de-duplicate & sort
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return df
 
-def _harmonize_cols(df: pd.DataFrame, require: Iterable[str]) -> pd.DataFrame:
-    rename = {"Mkt-RF": "MKT_RF", "MKT-RF": "MKT_RF", "Mkt_RF": "MKT_RF", "Mom   ": "Mom"}
+def _harmonize_five(df: pd.DataFrame) -> pd.DataFrame:
+    """Return 5F+RF with canonical names."""
+    rename = {
+        "Mkt-RF": "MKT_RF", "MKT-RF": "MKT_RF", "Mkt_RF": "MKT_RF",
+        "SMB": "SMB", "HML": "HML", "RMW": "RMW", "CMA": "CMA", "RF": "RF",
+    }
     df = df.rename(columns={c: rename.get(c, c) for c in df.columns})
-    keep = [c for c in require if c in df.columns]
+    keep = [c for c in ["MKT_RF","SMB","HML","RMW","CMA","RF"] if c in df.columns]
     return df[keep].copy()
+
+def _harmonize_mom(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect the momentum column and return it standardized as 'Mom'.
+    Ken French files may label momentum as 'Mom', 'Mom   ', or 'WML'.
+    """
+    # Cleaned view of column names
+    cols = list(df.columns)
+    norm = {c: c.strip() for c in cols}
+    lower = {c: norm[c].lower() for c in cols}
+
+    # Preferred candidates (in order)
+    # - any column whose cleaned name equals 'Mom'
+    # - any column containing 'mom'
+    # - any column whose cleaned name equals 'WML' (winners minus losers)
+    mom_col = None
+    for c in cols:
+        if norm[c] == "Mom":
+            mom_col = c
+            break
+    if mom_col is None:
+        for c in cols:
+            if "mom" in lower[c]:
+                mom_col = c
+                break
+    if mom_col is None:
+        for c in cols:
+            if norm[c].upper() == "WML":
+                mom_col = c
+                break
+
+    if mom_col is None:
+        raise ValueError(f"No momentum column found. Columns: {cols}")
+
+    out = df.copy()
+    if norm[mom_col] != "Mom":
+        out = out.rename(columns={mom_col: "Mom"})
+
+    # Keep only the standardized column
+    return out[["Mom"]].copy()
+
+def _coverage(df: pd.DataFrame) -> str:
+    return f"{df.index.min():%Y-%m} → {df.index.max():%Y-%m}  (n={len(df)})"
 
 def _ensure_all_cols(df: pd.DataFrame, ordered_cols: Iterable[str]) -> pd.DataFrame:
     for c in ordered_cols:
         if c not in df.columns:
             df[c] = pd.NA
     return df[list(ordered_cols)]
-
-def _coverage(df: pd.DataFrame) -> str:
-    return f"{df.index.min():%Y-%m} → {df.index.max():%Y-%m}  (n={len(df)})"
 
 def _write_artifacts(stem: str, df: pd.DataFrame, sources: list[str], extras: dict | None = None):
     df = df.sort_index()
@@ -121,36 +165,75 @@ def _write_artifacts(stem: str, df: pd.DataFrame, sources: list[str], extras: di
         "index": "month_end",
         "sources": sources,
         "built_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "notes": "Columns in percent; month-end index. Missing columns (if any) filled with NaN before save.",
+        "notes": "Columns in percent; month-end index. Alignment diagnostics applied; build fails if momentum is empty.",
     }
     if extras:
         meta.update(extras)
     (META_DIR / f"{stem}.json").write_text(json.dumps(meta, indent=2))
 
-# ---------- US FF5 + Momentum ----------
+def _align_and_join_with_diagnostics(
+    five: pd.DataFrame,
+    mom: pd.DataFrame,
+    required_cols: Iterable[str],
+    mom_name: str = "Mom",
+) -> Tuple[pd.DataFrame, dict]:
+    """Force month-end, de-dup, align, diagnose, and join. Fail if overlap==0 or Mom empty."""
+    def _me(df: pd.DataFrame) -> pd.DataFrame:
+        idx = pd.to_datetime(df.index).to_period("M").to_timestamp("M")
+        out = df.copy()
+        out.index = idx
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out
+
+    five_me = _me(five)
+    mom_me  = _me(mom)
+
+    diag = {
+        "five_first": five_me.index.min(), "five_last": five_me.index.max(), "five_len": len(five_me),
+        "mom_first": mom_me.index.min(),   "mom_last":   mom_me.index.max(),   "mom_len":  len(mom_me),
+        "overlap_len": len(five_me.index.intersection(mom_me.index)),
+        "mom_columns": list(mom_me.columns),
+    }
+
+    print("  ├─ 5F window:", _coverage(five_me))
+    print("  ├─ MOM window:", _coverage(mom_me))
+    print("  └─ Overlap months:", diag["overlap_len"])
+
+    if diag["overlap_len"] == 0:
+        raise RuntimeError(f"No overlapping dates between five-factor and momentum tables. mom_cols={diag['mom_columns']}")
+
+    # join
+    df = five_me.join(mom_me[[mom_name]], how="left")
+    df = _ensure_all_cols(df, list(required_cols))
+
+    # sanity: momentum must not be entirely NA
+    if df[mom_name].notna().sum() == 0:
+        raise RuntimeError(f"Momentum series is empty after join; mom_cols={diag['mom_columns']}")
+
+    return df, diag
+
+# ---------- Builders ----------
 def build_us_ff5_mom():
     print("Building US FF5 + Momentum …")
-    five = _harmonize_cols(_read_ff_zip_monthly(US_5F_URL), ["MKT_RF", "SMB", "HML", "RMW", "CMA", "RF"])
-    mom  = _harmonize_cols(_read_ff_zip_monthly(US_MOM_URL),  ["Mom"])
-    print("  5F:",  _coverage(five))
-    print("  MOM:", _coverage(mom))
+    five = _harmonize_five(_read_ff_zip_monthly(US_5F_URL))
+    mom  = _harmonize_mom(_read_ff_zip_monthly(US_MOM_URL))
 
-    df = _ensure_all_cols(five.join(mom, how="left"), ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
+    df, _ = _align_and_join_with_diagnostics(
+        five, mom, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"], mom_name="Mom"
+    )
     _write_artifacts("us_ff5_mom", df, [US_5F_URL, US_MOM_URL], extras={"universe": "US", "includes_emerging": False})
     print("  ✅ US FF5+Mom:", _coverage(df))
 
-# ---------- Developed ex-US FF5 + Momentum (saved under legacy global_exus_ff5_mom) ----------
 def build_developed_exus_ff5_mom_as_global_stem():
     print("Building Developed ex-US FF5 + Momentum (output: global_exus_ff5_mom) …")
-    five = _harmonize_cols(_read_ff_zip_monthly(DEXUS_5F_URL),  ["MKT_RF","SMB","HML","RMW","CMA","RF"])
-    mom  = _harmonize_cols(_read_ff_zip_monthly(DEXUS_MOM_URL), ["Mom"])
-    print("  5F:",  _coverage(five))
-    print("  MOM:", _coverage(mom))
+    five = _harmonize_five(_read_ff_zip_monthly(DEXUS_5F_URL))
+    mom  = _harmonize_mom(_read_ff_zip_monthly(DEXUS_MOM_URL))
 
-    df = _ensure_all_cols(five.join(mom, how="left"), ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
+    df, _ = _align_and_join_with_diagnostics(
+        five, mom, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"], mom_name="Mom"
+    )
     _write_artifacts(
-        "global_exus_ff5_mom", df,
-        [DEXUS_5F_URL, DEXUS_MOM_URL],
+        "global_exus_ff5_mom", df, [DEXUS_5F_URL, DEXUS_MOM_URL],
         extras={"universe": "Developed ex-US", "includes_emerging": False}
     )
     print("  ✅ Developed ex-US FF5+Mom:", _coverage(df))
