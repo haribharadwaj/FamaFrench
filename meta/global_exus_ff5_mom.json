@@ -1,8 +1,8 @@
 {
   "dataset": "global_exus_ff5_mom",
   "first_date": "1990-07-31",
-  "last_date": "2025-08-31",
-  "rows": 422,
+  "last_date": "2019-06-30",
+  "rows": 348,
   "columns": [
     "MKT_RF",
     "SMB",
@@ -15,14 +15,11 @@
   "units": "percent",
   "index": "month_end",
   "sources": [
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip",
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Minus_US_5_Factors_CSV.zip",
     "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_CSV.zip",
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_EX_US_CSV.zip",
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_MOM_Factor_CSV.zip",
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip",
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip"
+    null
   ],
-  "built_utc": "2025-10-05T01:29:55.482846Z",
-  "notes": "Always include columns MKT_RF, SMB, HML, RMW, CMA, Mom, RF; missing columns filled with NaN."
+  "built_utc": "2025-10-05T01:59:22.627152Z",
+  "notes": "Always include columns MKT_RF, SMB, HML, RMW, CMA, Mom, RF; missing columns filled with NaN.",
+  "universe": "Global ex-US (generic)",
+  "includes_emerging": true
 }

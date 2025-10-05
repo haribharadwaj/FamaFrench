@@ -74,11 +74,13 @@ def _ensure_all_cols(df, all_cols):
     # canonical order
     return df[[c for c in all_cols]]
 
-def _write_all(name, df, sources):
+def _write_all(name, df, sources, extras=None):
     df = df.sort_index()
     # Write parquet and gzipped csv
+    OUT.mkdir(exist_ok=True); META.mkdir(exist_ok=True)
     df.to_parquet(OUT / f"{name}.parquet", index=True)
     df.to_csv(OUT / f"{name}.csv.gz", compression="gzip", float_format="%.6f")
+
     meta = {
         "dataset": name,
         "first_date": df.index.min().strftime("%Y-%m-%d"),
@@ -91,7 +93,11 @@ def _write_all(name, df, sources):
         "built_utc": datetime.utcnow().isoformat() + "Z",
         "notes": "Always include columns MKT_RF, SMB, HML, RMW, CMA, Mom, RF; missing columns filled with NaN."
     }
+    if extras:
+        meta.update(extras)
+
     (META / f"{name}.json").write_text(json.dumps(meta, indent=2))
+
 
 # ---------- US FF5 + Momentum ----------
 def build_us_ff5_mom():
@@ -111,60 +117,103 @@ def build_us_ff5_mom():
     ])
 
 # ---------- Global ex-US FF5 + Momentum (multiple fallbacks) ----------
+def _coverage_str(df: pd.DataFrame) -> str:
+    return f"{df.index.min():%Y-%m} → {df.index.max():%Y-%m}  (n={len(df)})"
+
 def build_global_exus_ff5_mom():
     """
-    Build Global ex-US 5 Factors + Momentum.
-    Tries multiple known URLs and mirrors.
+    Build a Global ex-US (Developed + Emerging, excluding U.S.) FF5 + Momentum dataset
+    when available; otherwise fall back to Developed ex-US. Writes a single file:
+      data/global_exus_ff5_mom.(parquet|csv.gz)
+    Metadata includes 'universe' and 'includes_emerging'.
     """
 
-    fallback_urls = [
-        # Primary URL (recently moved or renamed)
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip",
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Minus_US_5_Factors_CSV.zip",
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_CSV.zip",
-        # Former canonical (often reappears)
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_EX_US_CSV.zip",
+    # Candidate 5-factor tables (try EM-inclusive first)
+    five_candidates = [
+        # Prefer: Global ex-US (Dev + EM, no US)
+        ("Global ex-US", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_EX_US_CSV.zip", True),
+        # Sometimes the site serves a generic 'Global_5_Factors_CSV.zip' with subpanels; our slicer grabs monthly.
+        ("Global ex-US (generic)", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_CSV.zip", True),
+        # Fall back: Developed ex-US (excludes Emerging)
+        ("Developed ex-US", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip", False),
+        ("Developed ex-US (minus US)", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Minus_US_5_Factors_CSV.zip", False),
     ]
 
     five = None
-    for url in fallback_urls:
+    five_label = None
+    includes_em = None
+    five_source = None
+
+    for label, url, inc_em in five_candidates:
         try:
-            print(f"Trying {url} ...")
-            five = _read_ff_zip(url, require_cols=["MKT_RF", "SMB", "HML", "RMW", "CMA", "RF"])
-            print(f"✅ Loaded 5-factor data from {url}")
+            print(f"Trying 5-factor: {label} … {url}")
+            tmp = _read_ff_zip(url, require_cols=["MKT_RF","SMB","HML","RMW","CMA","RF"])
+            five = tmp.rename(columns={"Mkt-RF":"MKT_RF","MKT-RF":"MKT_RF"})
+            five = five[[c for c in ["MKT_RF","SMB","HML","RMW","CMA","RF"] if c in five.columns]]
+            five_label = label
+            includes_em = bool(inc_em)
+            five_source = url
+            print(f"  ✅ 5-factor loaded: {_coverage_str(five)}")
             break
         except Exception as e:
-            print(f"⚠️  Failed {url}: {e}")
-            continue
+            print(f"  ⚠️ {label} failed: {e}")
 
     if five is None:
-        raise RuntimeError("❌ Could not download any version of Global/Developed ex-US 5-factor dataset")
+        raise RuntimeError("❌ Could not download Global/Developed ex-US 5-factor dataset from any candidate URL.")
 
-    # Momentum fallback list
-    mom_urls = [
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_MOM_Factor_CSV.zip",
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip",
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip",
+    # Candidate momentum tables (match universe if possible)
+    mom_candidates = [
+        # ex-US momentum variants
+        ("Global ex-US Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_ex_US_MOM_Factor_CSV.zip"),
+        ("Developed ex-US Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_MOM_Factor_CSV.zip"),
+        # global momentum as a last resort
+        ("Global Momentum", "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_MOM_Factor_CSV.zip"),
     ]
 
     mom = None
-    for url in mom_urls:
+    mom_source = None
+    for label, url in mom_candidates:
         try:
-            print(f"Trying momentum {url} ...")
-            mom = _read_ff_zip(url, require_cols=["Mom"])
-            print(f"✅ Loaded Momentum data from {url}")
+            print(f"Trying momentum: {label} … {url}")
+            tmp = _read_ff_zip(url, require_cols=["Mom"])
+            mom = tmp.copy()
+            # Harmonize column name to 'Mom'
+            if "Mom" not in mom.columns:
+                alt = [c for c in mom.columns if "mom" in c.lower()]
+                if alt:
+                    mom = mom.rename(columns={alt[0]: "Mom"})
+            mom = mom[["Mom"]]
+            mom_source = url
+            print(f"  ✅ Momentum loaded: {_coverage_str(mom)}")
             break
         except Exception as e:
-            print(f"⚠️  Failed momentum URL {url}: {e}")
-            continue
+            print(f"  ⚠️ {label} failed: {e}")
 
     if mom is None:
-        raise RuntimeError("❌ Could not download any version of Global/Developed ex-US momentum factor")
+        raise RuntimeError("❌ Could not download any ex-US momentum factor (ex-US or global).")
 
-    # Merge, harmonize, and fill missing columns
+    # Merge and finalize schema
     df = five.join(mom, how="left")
-    df = _ensure_all_cols(df, ["MKT_RF", "SMB", "HML", "RMW", "CMA", "Mom", "RF"])
-    _write_all("global_exus_ff5_mom", df, sources=fallback_urls + mom_urls)
+    df = _ensure_all_cols(df, ["MKT_RF","SMB","HML","RMW","CMA","Mom","RF"])
+
+    # Report coverage in console
+    print("=== Global/Developed ex-US FF5 + Mom ===")
+    print(f"Universe: {five_label}  |  includes_emerging={includes_em}")
+    print(f"Coverage: {_coverage_str(df)}")
+    print(f"5-factor source: {five_source}")
+    print(f"Momentum source: {mom_source}")
+
+    # Write with rich metadata
+    _write_all(
+        "global_exus_ff5_mom",
+        df,
+        sources=[five_source, mom_source],
+        extras={
+            "universe": five_label,
+            "includes_emerging": bool(includes_em)
+        }
+    )
+
 
 
 if __name__ == "__main__":

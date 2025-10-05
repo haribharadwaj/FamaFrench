@@ -18,6 +18,6 @@
     "Ken French Data Library: F-F_Research_Data_5_Factors_2x3 (Monthly)",
     "Ken French Data Library: F-F_Momentum_Factor (Monthly)"
   ],
-  "built_utc": "2025-10-05T01:29:54.813768Z",
+  "built_utc": "2025-10-05T01:59:21.197105Z",
   "notes": "Always include columns MKT_RF, SMB, HML, RMW, CMA, Mom, RF; missing columns filled with NaN."
 }
