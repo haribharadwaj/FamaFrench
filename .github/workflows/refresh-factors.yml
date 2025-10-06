@@ -1,0 +1,49 @@
+name: Refresh Fama–French factors
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Run at 09:30 UTC on the 3rd of every month
+    - cron: "30 9 3 * *"
+
+permissions:
+  contents: write  # required to push updated data/meta files
+
+jobs:
+  build:
+    name: Build and publish updated factor files
+    runs-on: ubuntu-latest
+    concurrency:
+      group: refresh-factors
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run builder
+        run: python build_factors.py
+
+      - name: Commit and push if changed
+        run: |
+          if [[ -n "$(git status --porcelain data meta)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data meta
+            git commit -m "Auto-refresh Fama–French factors: $(date -u +'%Y-%m-%d')"
+            git push
+          else
+            echo "No changes to commit."
+          fi
