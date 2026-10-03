@@ -1,8 +1,8 @@
 {
   "dataset": "global_exus_ff5_mom",
   "first_date": "1990-07-31",
-  "last_date": "2026-07-31",
-  "rows": 433,
+  "last_date": "2026-08-31",
+  "rows": 434,
   "columns": [
     "MKT_RF",
     "SMB",
@@ -18,7 +18,7 @@
     "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_5_Factors_CSV.zip",
     "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Developed_ex_US_Mom_Factor_CSV.zip"
   ],
-  "built_utc": "2026-09-03T09:38:14+00:00",
+  "built_utc": "2026-10-03T14:23:07+00:00",
   "notes": "Columns in percent; month-end index. Alignment diagnostics applied; build fails if momentum is empty.",
   "universe": "Developed ex-US",
   "includes_emerging": false
